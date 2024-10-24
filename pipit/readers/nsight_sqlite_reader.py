@@ -60,6 +60,7 @@ class NSightSQLiteReader:
         SELECT
             start as Enter,
             end as Leave,
+            deviceId as gpuId,
             value as Name,
             streamId,
             'kernel' as type,
@@ -72,25 +73,27 @@ class NSightSQLiteReader:
         SELECT
             start as Enter,
             end as Leave,
+            deviceId as gpuId,
             memcpy_labels.name as Name,
             streamId,
             memcpy_labels.name as type,
             bytes
         FROM CUPTI_ACTIVITY_KIND_MEMCPY as cuda_memcpy
         JOIN ENUM_CUDA_MEMCPY_OPER as memcpy_labels
-            ON  cuda_memcpy.copyKind = memcpy_labels.id
+            ON cuda_memcpy.copyKind = memcpy_labels.id
         """,
         """
         SELECT
             start as Enter,
             end as Leave,
+            deviceId as gpuId,
             memset_labels.name as Name,
             streamId,
             memset_labels.name as type,
             bytes
         FROM CUPTI_ACTIVITY_KIND_MEMSET as cuda_memset
         JOIN ENUM_CUDA_MEM_KIND as memset_labels
-            ON cuda_memcpy.copyKind = memset_labels.id
+            ON cuda_memset.memKind = memset_labels.id
         """,]
         # TODO: reading in all the gpu metrics takes up a lot of memory
         # We should figure out which ones we want exactly
