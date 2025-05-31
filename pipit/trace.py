@@ -1057,6 +1057,140 @@ class Trace:
         total_time = ann_time
 
         return total_time
+    
+    def ann_time_breakdown_v2(self, filter_regex=None):
+        """
+        Time breakdown by NVTX-annotation, using the `_children` pointers.
+
+        Now supports repeated annotation names by indexing results with each annotation's row-index.
+        Returns a DataFrame with:
+           - index  = annotation row-index (ann_idx)
+           - columns: ["Name", "gpu_time", "gpu_idle_time"]
+        """
+        # calculate inclusive metrics
+        if "time.inc" not in self.events.columns:
+            self.calc_inc_metrics(["Timestamp (ns)"])
+
+        # calculate exclusive time if needed
+        if "time.exc" not in self.events.columns:
+            self.calc_exc_metrics(["Timestamp (ns)"])
+
+        # 1) Select all "Enter" events of type "annotation"
+        ann_events = self.events[
+            (self.events["type"] == "annotation") &
+            (self.events["Event Type"] == "Enter")
+        ]
+
+        # 2) Optionally filter by regex on the annotation Name
+        if filter_regex is not None:
+            if isinstance(filter_regex, list):
+                filter_pattern = "|".join(filter_regex)
+            else:
+                filter_pattern = filter_regex
+            ann_events = ann_events[ann_events["Name"].str.contains(filter_pattern, regex=True)]
+
+        # Prepare a list for per-annotation records
+        records = []
+
+        # 3) For each annotation row (by index), walk its descendants
+        for ann_idx, ann_row in ann_events.iterrows():
+            ann_name = ann_row["Name"]
+            raw_children = ann_row["_children"]
+            cpu_time = ann_row["time.inc"]
+
+            # If _children is NaN, record zeros immediately
+            is_list_like = isinstance(raw_children, (list, tuple, np.ndarray))
+            if (not is_list_like) and pd.isna(raw_children):
+                records.append({
+                    "ann_idx": ann_idx,
+                    "Name": ann_name,
+                    "cpu_time": cpu_time,
+                    "gpu_time": 0,
+                    "comm_time": 0,
+                    "gpu_idle_time": 0,
+                })
+                continue
+
+              
+            # Normalize raw_children into a list of ints
+            if isinstance(raw_children, (int, np.integer)):
+                child_stack = [int(raw_children)]
+            else:
+                # Assume it's already a Python list of ints
+                child_stack = list(raw_children)
+
+
+            visited = set()
+            all_timestamps = []
+            all_matching = []
+            active_gpu_time = 0
+            comm_time = 0
+
+            # Depth‐first traversal of all descendants
+            while child_stack:
+                cid = child_stack.pop()
+                if cid in visited:
+                    continue
+                if cid not in self.events.index:
+                    # Skip invalid indices
+                    continue
+                  
+                visited.add(cid)
+                child_row = self.events.loc[cid]
+                child_type = child_row["type"]
+
+                # Record this row's timestamps (if present)
+                ts = child_row["Timestamp (ns)"]
+                mts = child_row["_matching_timestamp"]
+
+                if not pd.isna(child_type) and child_type in ("kernel", "comm"):
+                    if not pd.isna(ts):
+                        all_timestamps.append(ts)
+                    if not pd.isna(mts):
+                        all_matching.append(mts)
+
+                # If this row has its own children, push them too
+                child_children = child_row["_children"]
+                if isinstance(child_children, (list, tuple, np.ndarray, int, np.integer)):
+                    if isinstance(child_children, (int, np.integer)):
+                        child_stack.append(int(child_children))
+                    else:
+                        child_stack.extend(list(child_children))
+
+                # If this row is a kernel or comm, accumulate its active GPU time
+                if not pd.isna(child_row["type"]):
+                    if child_row["type"] in ("kernel", "comm"):
+                        if (not pd.isna(ts)) and (not pd.isna(mts)):
+                            active_gpu_time += abs(mts - ts)
+
+                            if child_row["type"] == "comm":
+                                comm_time += abs(mts - ts)
+                    
+
+            # 4) Compute overall [min, max] window, then idle time
+            if all_timestamps or all_matching:
+                overall_min = min(all_timestamps + all_matching)
+                overall_max = max(all_timestamps + all_matching)
+                idle_gpu_time = (overall_max - overall_min) - active_gpu_time
+                idle_gpu_time = max(idle_gpu_time, 0)  # clamp ≥ 0
+            else:
+                idle_gpu_time = 0
+
+            records.append({
+                "ann_idx": ann_idx,
+                "Name": ann_name,
+                "cpu_time": cpu_time,
+                "gpu_time": active_gpu_time,
+                "comm_time": comm_time,
+                "gpu_idle_time": idle_gpu_time,
+            })
+
+        # 5) Build DataFrame, indexed by ann_idx (annotation row-index)
+        result_df = (
+            pd.DataFrame(records)
+              .set_index("ann_idx")[["Name", "cpu_time", "gpu_time", "comm_time", "gpu_idle_time"]]
+        )
+        return result_df
 
     def filter_by_label(self, label_name, filter_range=None):
         """
