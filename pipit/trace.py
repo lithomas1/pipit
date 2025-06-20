@@ -5,6 +5,8 @@
 
 import numpy as np
 import pandas as pd
+import copy
+import re
 
 from pipit.util.cct import create_cct
 
@@ -1058,11 +1060,21 @@ class Trace:
 
         return total_time
     
-    def ann_time_breakdown_v2(self, filter_regex=None):
+    def ann_time_breakdown_v2(self, 
+                              filter_regex=None, 
+                              mapper=None,
+                              ):
         """
         Time breakdown by NVTX-annotation, using the `_children` pointers.
 
         Now supports repeated annotation names by indexing results with each annotation's row-index.
+        Parameters
+        ----------
+        filter_regex: str, list, optional
+            A regex string or list of regexes to select specific annotations
+            to include in the breakdown.
+        mapper: dict, optional
+            A dictionary mapping kernel names to their corresponding groups
         Returns a DataFrame with:
            - index  = annotation row-index (ann_idx)
            - columns: ["Name", "gpu_time", "gpu_idle_time"]
@@ -1088,6 +1100,17 @@ class Trace:
             else:
                 filter_pattern = filter_regex
             ann_events = ann_events[ann_events["Name"].str.contains(filter_pattern, regex=True)]
+        
+        breakdown_columns = {
+            "gpu_time": 0,
+            "gpu_idle_time": 0,
+        }
+
+        # Based on the mapper, get the different time columns we need to compute
+        if mapper is not None:
+            for key, value in mapper.items():
+                if value not in breakdown_columns:
+                    breakdown_columns[value] = 0
 
         # Prepare a list for per-annotation records
         records = []
@@ -1105,9 +1128,7 @@ class Trace:
                     "ann_idx": ann_idx,
                     "Name": ann_name,
                     "cpu_time": cpu_time,
-                    "gpu_time": 0,
-                    "comm_time": 0,
-                    "gpu_idle_time": 0,
+                    **breakdown_columns,
                 })
                 continue
 
@@ -1124,7 +1145,7 @@ class Trace:
             all_timestamps = []
             all_matching = []
             active_gpu_time = 0
-            comm_time = 0
+            breakdown = copy.deepcopy(breakdown_columns)
 
             # Depth‐first traversal of all descendants
             while child_stack:
@@ -1161,10 +1182,16 @@ class Trace:
                 if not pd.isna(child_row["type"]):
                     if child_row["type"] in ("kernel", "comm"):
                         if (not pd.isna(ts)) and (not pd.isna(mts)):
+                            breakdown["gpu_time"] += abs(mts - ts)
                             active_gpu_time += abs(mts - ts)
 
-                            if child_row["type"] == "comm":
-                                comm_time += abs(mts - ts)
+                            if mapper is not None:
+                                # Match the name with the mapper key regex
+                                for key, value in mapper.items():
+                                    label = child_row["Name"]
+                                    if re.search(key, label):
+                                        breakdown[value] += abs(mts - ts)
+                                        break
                     
 
             # 4) Compute overall [min, max] window, then idle time
@@ -1173,6 +1200,7 @@ class Trace:
                 overall_max = max(all_timestamps + all_matching)
                 idle_gpu_time = (overall_max - overall_min) - active_gpu_time
                 idle_gpu_time = max(idle_gpu_time, 0)  # clamp ≥ 0
+                breakdown["gpu_idle_time"] += idle_gpu_time
             else:
                 idle_gpu_time = 0
 
@@ -1180,15 +1208,14 @@ class Trace:
                 "ann_idx": ann_idx,
                 "Name": ann_name,
                 "cpu_time": cpu_time,
-                "gpu_time": active_gpu_time,
-                "comm_time": comm_time,
-                "gpu_idle_time": idle_gpu_time,
+                **breakdown,
             })
 
+        
         # 5) Build DataFrame, indexed by ann_idx (annotation row-index)
         result_df = (
             pd.DataFrame(records)
-              .set_index("ann_idx")[["Name", "cpu_time", "gpu_time", "comm_time", "gpu_idle_time"]]
+              .set_index("ann_idx")[["Name", "cpu_time"] + list(breakdown_columns.keys())]
         )
         return result_df
 
