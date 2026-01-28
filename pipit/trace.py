@@ -1103,6 +1103,7 @@ class Trace:
         
         breakdown_columns = {
             "gpu_time": 0,
+            "mem_time": 0,
             "gpu_idle_time": 0,
         }
 
@@ -1164,7 +1165,7 @@ class Trace:
                 ts = child_row["Timestamp (ns)"]
                 mts = child_row["_matching_timestamp"]
 
-                if not pd.isna(child_type) and child_type in ("kernel", "comm"):
+                if not pd.isna(child_type) and child_type in ("kernel", "cuda_memcpy"):
                     if not pd.isna(ts):
                         all_timestamps.append(ts)
                     if not pd.isna(mts):
@@ -1180,10 +1181,14 @@ class Trace:
 
                 # If this row is a kernel or comm, accumulate its active GPU time
                 if not pd.isna(child_row["type"]):
-                    if child_row["type"] in ("kernel", "comm"):
+                    if child_row["type"] in ("kernel", "cuda_memcpy"):
                         if (not pd.isna(ts)) and (not pd.isna(mts)):
-                            breakdown["gpu_time"] += abs(mts - ts)
-                            active_gpu_time += abs(mts - ts)
+                            if child_row["type"] == "kernel":
+                                breakdown["gpu_time"] += abs(mts - ts)
+                                active_gpu_time += abs(mts - ts)
+                            else:
+                                breakdown["mem_time"] += abs(mts - ts)
+                                active_gpu_time += abs(mts - ts)
 
                             if mapper is not None:
                                 # Match the name with the mapper key regex
